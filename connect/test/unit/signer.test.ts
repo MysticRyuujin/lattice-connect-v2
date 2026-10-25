@@ -11,19 +11,27 @@ const RESPONSE_TOPIC = "from_agent/dev1/response/req1"
 function fakeBroker(opts: {
   publishDelayMs?: number,
   publishError?: Error,
+  publishNeverAcks?: boolean,
+  subscribeError?: Error,
   unsubscribeError?: Error,
+  unsubscribeNeverSettles?: boolean,
   replyAfterPublishMs?: number,
   replyBeforePublishAck?: boolean,
 } = {}) {
   const events = new EventEmitter()
   const unsubscribed: string[] = []
   const reply = () => events.emit("message", RESPONSE_TOPIC, Buffer.from([3, 2, 1]))
+  const never = () => new Promise<never>(() => {})
 
   const client: BrokerClient = {
     on: events.on.bind(events),
-    subscribeAsync: async () => [],
+    subscribeAsync: async () => {
+      if (opts.subscribeError) throw opts.subscribeError
+      return []
+    },
     publishAsync: async () => {
       if (opts.replyBeforePublishAck) reply()
+      if (opts.publishNeverAcks) await never()
       await sleep(opts.publishDelayMs ?? 0)
       if (opts.publishError) throw opts.publishError
       if (opts.replyAfterPublishMs !== undefined) setTimeout(reply, opts.replyAfterPublishMs)
@@ -31,6 +39,7 @@ function fakeBroker(opts: {
     },
     unsubscribeAsync: async (topic: string) => {
       unsubscribed.push(topic)
+      if (opts.unsubscribeNeverSettles) await never()
       if (opts.unsubscribeError) throw opts.unsubscribeError
       return undefined
     },
@@ -74,4 +83,19 @@ test("AC-4n: the device timeout starts at the publish acknowledgement", async ()
   const signer = createSigner(broker.client, undefined, 50)
 
   assert.deepEqual(await signer.sendForApproval(REQUEST, "dev1", "req1"), { kind: "answered", payload: "030201" })
+})
+
+test("AC-5: a reply before an acknowledgement that never arrives is answered", async () => {
+  const broker = fakeBroker({ replyBeforePublishAck: true, publishNeverAcks: true })
+  const signer = createSigner(broker.client, undefined, 50)
+
+  assert.deepEqual(await signer.sendForApproval(REQUEST, "dev1", "req1"), { kind: "answered", payload: "030201" })
+})
+
+test("AC-6: a failed subscribe fails the request without waiting for the unsubscribe", async () => {
+  const broker = fakeBroker({ subscribeError: new Error("connection closed"), unsubscribeNeverSettles: true })
+  const signer = createSigner(broker.client, undefined, 50)
+
+  await assert.rejects(signer.sendForApproval(REQUEST, "dev1", "req1"), /connection closed/)
+  assert.deepEqual(broker.unsubscribed, [RESPONSE_TOPIC])
 })

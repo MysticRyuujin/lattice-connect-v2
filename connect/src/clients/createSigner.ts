@@ -82,18 +82,21 @@ async function relay({ client, replies, logger, timeoutMs }: RelayContext, paylo
 
   try {
     await client.subscribeAsync(responseTopic, { qos: 1 })
-    await client.publishAsync(publishTopic(deviceId, requestId), payload, {
+    const published = client.publishAsync(publishTopic(deviceId, requestId), payload, {
       qos: 1,
       retain: false,
       dup: false
-    })
+    }).then(() => undefined)
 
-    // The timeout starts only after the publish, so a request that the broker
-    // has not accepted yet cannot time out and then reach the device later.
-    deadline = startDeadline(timeoutMs)
-    logger?.info(`.: [?] Awaiting approval (with timeout: ${timeoutMs}ms)...`)
-
-    const result = await Promise.race([listener.reply, deadline.timedOut])
+    // A reply that arrives first answers the request, even if the acknowledgement is lost.
+    let result = await Promise.race([listener.reply, published])
+    if (!result) {
+      // The timeout starts only after the publish, so a request that the broker
+      // has not accepted yet cannot time out and then reach the device later.
+      deadline = startDeadline(timeoutMs)
+      logger?.info(`.: [?] Awaiting approval (with timeout: ${timeoutMs}ms)...`)
+      result = await Promise.race([listener.reply, deadline.timedOut])
+    }
     logOutcome(logger, result, deviceId, requestId)
     return result
   } catch (error) {
@@ -102,8 +105,9 @@ async function relay({ client, replies, logger, timeoutMs }: RelayContext, paylo
   } finally {
     deadline?.cancel()
     listener.stop()
-    // Cleanup only: the outcome is already decided, so a failure here must not change it.
-    await client.unsubscribeAsync(responseTopic).catch(error =>
+    // Cleanup only, so it must not change or delay the outcome. While the broker is
+    // offline the client queues the unsubscribe until it reconnects.
+    void client.unsubscribeAsync(responseTopic).catch(error =>
       logger?.info(".: [!] Unsubscribe failed:\n", JSON.stringify({ responseTopic, error }))
     )
   }
